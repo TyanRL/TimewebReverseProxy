@@ -1,0 +1,31 @@
+[workspace]
+channels = ["conda-forge"]
+name = "timewebreversproxy"
+platforms = ["linux-64", "win-64"]
+
+version = "0.1.0"
+
+
+[tasks]
+check_src_errors = "pyright src/ --level error"
+
+
+[dependencies]
+python = ">=3.10,<3.11"
+pydeps = ">=3.0.1,<4"
+pylint = ">=3.3.8,<4"
+pyright = ">=1.1.403,<2"
+pydantic = ">=2.11.7,<3"
+pytest = ">=8.4.1,<9"
+pytest-asyncio = ">=1.1.0,<2"
+
+
+
+[pypi-dependencies]
+openai=">=1.98.0,<2.0.0"
+wcwidth=">=0.2.13,<1.0"
+python-dotenv=">=1.1.1,<2.0.0"
+nest-asyncio=">=1.6.0,<2.0.0"
+mysql-connector-python=">=9.4.0,<10.0.0"
+psycopg2-binary=">=2.9.10,<3.0.0"
+
