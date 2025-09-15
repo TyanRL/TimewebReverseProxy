@@ -175,13 +175,27 @@ async def proxy_v1(request: Request, path: str = ""):
     # Логируем целевой upstream URL для диагностики
     try:
         # Соберём целевой URL (без лишних двойных слэшей)
-        if path:
-            target_url = settings.OPENAI_BASE_URL.rstrip("/") + "/" + path.lstrip("/")
+        # Нормализуем базовый URL и путь, чтобы защититься от конфигурации клиента,
+        # которая уже включает /v1 в base_url и при этом SDK шлёт пути вида /v1/...
+        base_no_slash = settings.OPENAI_BASE_URL.rstrip("/")
+        normalized_path = path.lstrip("/") if path else ""
+        # Защита от дублирующего префикса: если базовый URL уже заканчивается на /v1
+        # и путь начинается с v1/, убираем ведущий "v1/" чтобы не получить /v1/v1/...
+        if base_no_slash.endswith("/v1") and normalized_path.startswith("v1/"):
+            normalized_path = normalized_path[len("v1/"):]
+            logger.info("removed duplicate /v1 from path; proxied path is now: %s", normalized_path or "<root>")
+        if normalized_path:
+            target_url = base_no_slash + "/" + normalized_path
         else:
+            # Если путь пустой — используем исходный OPENAI_BASE_URL (чтобы сохранить поведение со слэшем на конце)
             target_url = settings.OPENAI_BASE_URL
         logger.info("proxying %s -> %s", request.method, target_url)
 
-        response = await reverse_proxy.proxy(request=patched_request, path=path)
+        # Передаём исходный path (не normalized_path) в reverse_proxy,
+        # чтобы оно правильно построило upstream-путь на основании scope/headers.
+        # Если мы удалили из path префикс v1, передаём обновлённый путь чтобы прокси не форсировал двойной v1.
+        proxied_path = normalized_path
+        response = await reverse_proxy.proxy(request=patched_request, path=proxied_path)
     except httpx.ReadTimeout:
         logger.warning("upstream read timeout while proxying /v1/%s", path)
         raise HTTPException(status_code=504, detail="Upstream read timeout")
