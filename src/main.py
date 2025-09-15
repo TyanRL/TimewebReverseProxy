@@ -108,7 +108,7 @@ async def _require_client(request: Request) -> Optional[str]:
     return token
 
 # --------------------- Reverse proxy core ---------------------
-_httpx_timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0)
+_httpx_timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=60.0)
 _httpx_client = httpx.AsyncClient(timeout=_httpx_timeout)
 reverse_proxy = ReverseHttpProxy(client=_httpx_client, base_url=settings.OPENAI_BASE_URL)
 
