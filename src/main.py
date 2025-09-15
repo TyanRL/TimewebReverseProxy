@@ -172,7 +172,15 @@ async def proxy_v1(request: Request, path: str = ""):
     patched_request = StarletteRequest(scope, request.receive)
 
     # Отдаём в прокси (SSE/стрим пробрасывается fastapi-proxy-lib)
+    # Логируем целевой upstream URL для диагностики
     try:
+        # Соберём целевой URL (без лишних двойных слэшей)
+        if path:
+            target_url = settings.OPENAI_BASE_URL.rstrip("/") + "/" + path.lstrip("/")
+        else:
+            target_url = settings.OPENAI_BASE_URL
+        logger.info("proxying %s -> %s", request.method, target_url)
+
         response = await reverse_proxy.proxy(request=patched_request, path=path)
     except httpx.ReadTimeout:
         logger.warning("upstream read timeout while proxying /v1/%s", path)
@@ -180,6 +188,28 @@ async def proxy_v1(request: Request, path: str = ""):
     except Exception:
         logger.exception("proxy error while handling /v1/%s", path)
         raise HTTPException(status_code=502, detail="Upstream error")
+
+    # При ошибочных статусах попробуем логировать тело ответа (предварительный просмотр)
+    try:
+        status = getattr(response, "status_code", None)
+        if status and status >= 400:
+            body_preview = None
+            try:
+                body = getattr(response, "body", None)
+                if body is None:
+                    # Могут быть стриминговые ответы — пометим как streaming
+                    body_preview = "<streaming or no body>"
+                else:
+                    if isinstance(body, (bytes, bytearray)):
+                        body_preview = body.decode(errors="replace")[:1000]
+                    else:
+                        body_preview = str(body)[:1000]
+            except Exception as e:
+                body_preview = f"<body read failed: {e}>"
+            logger.warning("upstream response %s for /v1/%s -> %s : %s", status, path, target_url, body_preview)
+    except Exception:
+        # Нельзя ломать проксирование логированием
+        pass
 
     # Лог
     try:
