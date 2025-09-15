@@ -4,10 +4,11 @@ import os
 import time
 from pathlib import Path
 from typing import Dict, Optional
+import httpx
 from fastapi_proxy_lib.core.http import ReverseHttpProxy
-from starlette.requests import Request as StarletteRequest 
-from starlette.responses import Response 
-from pydantic_settings import BaseSettings 
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response
+from pydantic_settings import BaseSettings
 
 from fastapi import FastAPI, Header, HTTPException, Request #type: ignore
 from fastapi.middleware.cors import CORSMiddleware #type: ignore
@@ -107,7 +108,16 @@ async def _require_client(request: Request) -> Optional[str]:
     return token
 
 # --------------------- Reverse proxy core ---------------------
-reverse_proxy = ReverseHttpProxy(client=None, base_url=settings.OPENAI_BASE_URL)
+_httpx_timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0)
+_httpx_client = httpx.AsyncClient(timeout=_httpx_timeout)
+reverse_proxy = ReverseHttpProxy(client=_httpx_client, base_url=settings.OPENAI_BASE_URL)
+
+@app.on_event("shutdown")
+async def _shutdown_httpx_client():
+    try:
+        await _httpx_client.aclose()
+    except Exception:
+        pass
 
 @app.get("/healthz")
 async def healthz():
@@ -162,7 +172,14 @@ async def proxy_v1(request: Request, path: str = ""):
     patched_request = StarletteRequest(scope, request.receive)
 
     # Отдаём в прокси (SSE/стрим пробрасывается fastapi-proxy-lib)
-    response = await reverse_proxy.proxy(request=patched_request, path=path)
+    try:
+        response = await reverse_proxy.proxy(request=patched_request, path=path)
+    except httpx.ReadTimeout:
+        logger.warning("upstream read timeout while proxying /v1/%s", path)
+        raise HTTPException(status_code=504, detail="Upstream read timeout")
+    except Exception:
+        logger.exception("proxy error while handling /v1/%s", path)
+        raise HTTPException(status_code=502, detail="Upstream error")
 
     # Лог
     try:
