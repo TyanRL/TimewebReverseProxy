@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings
 
 from fastapi import FastAPI, HTTPException, Request  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from fastapi.responses import JSONResponse, PlainTextResponse # type: ignore
 
 # =====================================================
 # Settings
@@ -24,7 +25,6 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/"  # keep trailing slash
     OPENROUTER_API_KEY: Optional[str] = None
     # Optional attribution headers recommended by OpenRouter
-    # Docs: https://openrouter.ai/docs/api-reference/overview
     OPENROUTER_HTTP_REFERER: Optional[str] = None  # e.g. https://yourapp.example
     OPENROUTER_X_TITLE: Optional[str] = None       # e.g. "My App"
 
@@ -45,13 +45,35 @@ class Settings(BaseSettings):
     # If false, replace Authorization with server-side API key for the chosen upstream
     FORWARD_CLIENT_AUTH: bool = False
 
+    # --- HTTP client timeouts & transport ---
+    HTTP_TIMEOUT_CONNECT: float = 20.0
+    HTTP_TIMEOUT_READ: float = 600.0
+    HTTP_TIMEOUT_WRITE: float = 300.0
+    HTTP_TIMEOUT_POOL: float = 120.0
+    HTTP2_ENABLED: bool = True
+
     # --- Logging ---
     LOG_JSONL_PATH: str = "logs/requests.jsonl"
+    ACCESS_LOG_NOISE_FILTER: bool = True  # suppress common scanner noise in uvicorn.access
 
     # --- CORS ---
     CORS_ALLOW_ORIGINS: str = "*"
     CORS_ALLOW_METHODS: str = "*"
     CORS_ALLOW_HEADERS: str = "*"
+
+    # --- Root behavior ---
+    ROOT_ALLOW_QUERIES: bool = False  # if false, GET / with query string returns 404
+
+    # --- Strict allow-list ---
+    ALLOWLIST_ENABLED: bool = False
+    # Comma-separated lists
+    ALLOWLIST_PREFIXES: str = "/v1/,/openai/,/openrouter/,/api/v1/"
+    ALLOWLIST_EXACT: str = "/healthz,/_meta/upstreams,/robots.txt,/admin/reload-clients,/"
+    # Whether to let any CORS preflight through regardless of path
+    ALLOWLIST_ALLOW_OPTIONS_ANY: bool = True
+    # Response to send when blocked
+    ALLOWLIST_DENY_CODE: int = 404
+    ALLOWLIST_DENY_MESSAGE: str = "Not found"
 
     class Config:
         env_file = ".env"
@@ -72,10 +94,119 @@ app.add_middleware(
     allow_headers=[h.strip() for h in settings.CORS_ALLOW_HEADERS.split(",") if h.strip()],
 )
 
+# -------------------- Strict allow-list middleware --------------------
+# Build allow-list sets from config once
+
+def _csv_list(s: str) -> List[str]:
+    return [x.strip() for x in (s or "").split(",") if x and x.strip()]
+
+_ALLOW_PREFIXES: Tuple[str, ...] = tuple(_csv_list(settings.ALLOWLIST_PREFIXES))
+_ALLOW_EXACT: set[str] = set(_csv_list(settings.ALLOWLIST_EXACT))
+
+@app.middleware("http")
+async def _allowlist_middleware(request: Request, call_next):
+    if settings.ALLOWLIST_ENABLED:
+        path = request.url.path or "/"
+        method = request.method.upper()
+
+        # OPTIONS preflight may be allowed broadly to not break CORS
+        if method == "OPTIONS" and settings.ALLOWLIST_ALLOW_OPTIONS_ANY:
+            return await call_next(request)
+
+        allowed = False
+        if path in _ALLOW_EXACT:
+            allowed = True
+        elif any(path.startswith(pfx) for pfx in _ALLOW_PREFIXES):
+            allowed = True
+
+        if not allowed:
+            return JSONResponse(
+                status_code=settings.ALLOWLIST_DENY_CODE,
+                content={"detail": settings.ALLOWLIST_DENY_MESSAGE},
+            )
+
+    return await call_next(request)
+
 Path(settings.LOG_JSONL_PATH).parent.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("proxy")
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
+
+# Optional: filter noisy access logs from random internet scanners
+class AccessLogNoiseFilter(logging.Filter):
+    noisy_substrings = (
+        "/favicon.ico",
+        "/sitemap.xml",
+        "/.env",
+        "/.git/",
+        "/dns-query",
+        "/resolve",
+        "/query",
+        "/wiki",
+        "/hello.world",
+        "eval-stdin.php",
+        "/vendor/phpunit",
+    )
+
+    METHODS = ("GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            path = ""
+            rl = None
+            args = getattr(record, "args", None)
+            if isinstance(args, dict):
+                rl = args.get("request_line")
+            elif isinstance(args, tuple) and len(args) >= 2:
+                rl = args[1]
+
+            # Normalize to string if possible
+            if isinstance(rl, (bytes, bytearray)):
+                req_line = rl.decode("utf-8", "ignore")
+            elif isinstance(rl, str):
+                req_line = rl
+            else:
+                req_line = None
+
+            if isinstance(req_line, str) and req_line:
+                parts = req_line.split(" ")
+                if len(parts) >= 2:
+                    path = parts[1]
+            else:
+                # Fallback: derive from formatted message without regex
+                try:
+                    msg = record.getMessage()
+                except Exception:
+                    msg = ""
+                for m in self.METHODS:
+                    token = f'"{m} '
+                    idx = msg.find(token)
+                    if idx != -1:
+                        start = idx + len(token)
+                        end = msg.find(" ", start)
+                        if end == -1:
+                            end = msg.find('"', start)
+                        if end != -1:
+                            path = msg[start:end]
+                        else:
+                            path = msg[start:]
+                        break
+
+            if not path:
+                return True  # fail-open
+
+            for s in self.noisy_substrings:
+                if s and s in path:
+                    return False
+        except Exception:
+            return True
+        return True
+
+try:
+    if settings.ACCESS_LOG_NOISE_FILTER:
+        logging.getLogger("uvicorn.access").addFilter(AccessLogNoiseFilter())
+except Exception:
+    pass
 
 # =====================================================
 # Client tokens
@@ -154,6 +285,32 @@ class Upstream:
         self.inject_headers = inject_headers or {}
         self.reverse_proxy = ReverseHttpProxy(client=_httpx_client, base_url=self.base_url)
 
+    @staticmethod
+    def sanitize_headers(headers: HttpHeaders) -> HttpHeaders:
+        """Drop hop-by-hop headers & ones that must be set by httpx/target.
+        RFC 7230: Connection, Keep-Alive, Proxy-*, TE, Trailer, Upgrade.
+        Also drop Host & Content-Length so httpx sets them correctly.
+        """
+        drop = {
+            b"connection",
+            b"proxy-connection",
+            b"keep-alive",
+            b"transfer-encoding",
+            b"upgrade",
+            b"te",
+            b"trailer",
+            b"proxy-authenticate",
+            b"proxy-authorization",
+            b"host",
+            b"content-length",
+        }
+        cleaned: HttpHeaders = []
+        for k, v in headers:
+            if k.lower() in drop:
+                continue
+            cleaned.append((k, v))
+        return cleaned
+
     def patch_headers(self, headers: HttpHeaders) -> HttpHeaders:
         """Replace or add Authorization and any upstream-specific headers
         when FORWARD_CLIENT_AUTH is disabled. Otherwise we leave Authorization as-is
@@ -210,8 +367,14 @@ class Upstream:
 
 
 # Shared httpx client / timeouts
-_httpx_timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=60.0)
-_httpx_client = httpx.AsyncClient(timeout=_httpx_timeout)
+_httpx_timeout = httpx.Timeout(
+    connect=settings.HTTP_TIMEOUT_CONNECT,
+    read=settings.HTTP_TIMEOUT_READ,
+    write=settings.HTTP_TIMEOUT_WRITE,
+    pool=settings.HTTP_TIMEOUT_POOL,
+)
+_httpx_client = httpx.AsyncClient(timeout=_httpx_timeout, http2=settings.HTTP2_ENABLED)
+
 
 # Compose upstreams
 openai_upstream = Upstream(
@@ -391,8 +554,25 @@ async def proxy_openrouter(request: Request, path: str = ""):
     return await _proxy(request, path, "openrouter")
 
 
+# 4) Alias to support clients pointing directly to /api/v1/* (OpenRouter-style base path)
+@app.api_route("/api/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def proxy_api_v1(request: Request, path: str = ""):
+    # Always treat /api/v1/* as OpenRouter
+    raw = f"api/v1/{path}" if path else "api/v1"
+    return await _proxy(request, raw, "openrouter")
+
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    return PlainTextResponse("User-agent: *Disallow: /")
+
+
 @app.get("/")
-async def root():
+async def root(request: Request):
+    # Avoid returning 200 OK for scanner queries like /?dns=...
+    if not settings.ROOT_ALLOW_QUERIES and request.query_params:
+        raise HTTPException(status_code=404, detail="Not found")
     return {
         "message": "Reverse Proxy ready. Use /v1 (OpenAI-compatible). Choose upstream via x-upstream header or use /openai/* or /openrouter/* base URLs.",
         "default_upstream": settings.UPSTREAM_DEFAULT,
