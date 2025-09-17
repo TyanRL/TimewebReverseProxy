@@ -3,37 +3,52 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
+
 import httpx
 from fastapi_proxy_lib.core.http import ReverseHttpProxy
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response
 from pydantic_settings import BaseSettings
 
-from fastapi import FastAPI, Header, HTTPException, Request #type: ignore
-from fastapi.middleware.cors import CORSMiddleware #type: ignore
+from fastapi import FastAPI, HTTPException, Request  # type: ignore
+from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 
-
-
-# --------------------- Settings ---------------------
+# =====================================================
+# Settings
+# =====================================================
 class Settings(BaseSettings):
-    # Upstream
-    OPENAI_BASE_URL: str = "https://api.openai.com/v1/"  # важно: слэш на конце
-    OPENAI_API_KEY: Optional[str] = None  # нужен если FORWARD_CLIENT_AUTH=false
+    # --- Upstreams ---
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1/"  # keep trailing slash
+    OPENAI_API_KEY: Optional[str] = None                 # used if FORWARD_CLIENT_AUTH=false
 
-    # Client auth (твой слой)
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/"  # keep trailing slash
+    OPENROUTER_API_KEY: Optional[str] = None
+    # Optional attribution headers recommended by OpenRouter
+    # Docs: https://openrouter.ai/docs/api-reference/overview
+    OPENROUTER_HTTP_REFERER: Optional[str] = None  # e.g. https://yourapp.example
+    OPENROUTER_X_TITLE: Optional[str] = None       # e.g. "My App"
+
+    # Which upstream to use by default if client doesn't specify
+    # one of: "openai" | "openrouter"
+    UPSTREAM_DEFAULT: str = "openai"
+
+    # Allow per-request upstream override via header `x-upstream: openai|openrouter`
+    ALLOW_UPSTREAM_HEADER: bool = True
+
+    # --- Client auth for your proxy layer ---
     AUTH_ENABLED: bool = True
-    CLIENTS_FILE: str = "clients.json"     # json: {"tokens":["..."]} или массив строк
+    CLIENTS_FILE: str = "clients.json"  # json: {"tokens":["..."]} or ["..."]
     ALLOW_BEARER_FROM_AUTH_HEADER: bool = True
-    CLIENT_HEADER_NAME: str = "x-api-key"   # альтернативный заголовок для клиентских токенов
+    CLIENT_HEADER_NAME: str = "x-api-key"  # alternative header for client tokens
 
-    # Пробрасывать Authorization клиента как есть к OpenAI
+    # If true, forward the client's Authorization header to the upstream as-is
+    # If false, replace Authorization with server-side API key for the chosen upstream
     FORWARD_CLIENT_AUTH: bool = False
 
-    # Логи
+    # --- Logging ---
     LOG_JSONL_PATH: str = "logs/requests.jsonl"
 
-    # CORS
+    # --- CORS ---
     CORS_ALLOW_ORIGINS: str = "*"
     CORS_ALLOW_METHODS: str = "*"
     CORS_ALLOW_HEADERS: str = "*"
@@ -42,10 +57,13 @@ class Settings(BaseSettings):
         env_file = ".env"
         extra = "ignore"
 
+
 settings = Settings()
 
-# --------------------- App/bootstrap ---------------------
-app = FastAPI(title="OpenAI Reverse Proxy (fastapi-proxy-lib)")
+# =====================================================
+# App / bootstrap
+# =====================================================
+app = FastAPI(title="Multi-Upstream Reverse Proxy (OpenAI + OpenRouter)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,8 +77,11 @@ logger = logging.getLogger("proxy")
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler())
 
-# --------------------- Client tokens ---------------------
+# =====================================================
+# Client tokens
+# =====================================================
 _client_tokens: set[str] = set()
+
 
 def _load_tokens(path: str) -> set[str]:
     p = Path(path)
@@ -76,9 +97,12 @@ def _load_tokens(path: str) -> set[str]:
         logger.error(f"clients file read failed: {e}")
     return set()
 
+
 _client_tokens = _load_tokens(settings.CLIENTS_FILE)
 
-# --------------------- Utils ---------------------
+# =====================================================
+# Utils
+# =====================================================
 
 def _redact(v: Optional[str]) -> Optional[str]:
     if not v:
@@ -87,12 +111,14 @@ def _redact(v: Optional[str]) -> Optional[str]:
         return "***"
     return v[:4] + "…" + v[-2:]
 
+
 async def _log(record: Dict):
     try:
         with open(settings.LOG_JSONL_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.error(f"log write failed: {e}")
+
 
 async def _require_client(request: Request) -> Optional[str]:
     if not settings.AUTH_ENABLED:
@@ -107,10 +133,128 @@ async def _require_client(request: Request) -> Optional[str]:
         raise HTTPException(status_code=403, detail="Invalid client token")
     return token
 
-# --------------------- Reverse proxy core ---------------------
+
+# =====================================================
+# Upstreams
+# =====================================================
+HttpHeaders = List[Tuple[bytes, bytes]]
+
+
+class Upstream:
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        server_api_key: Optional[str],
+        inject_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.name = name
+        self.base_url = base_url.rstrip("/") + "/"  # normalize trailing slash
+        self.server_api_key = server_api_key
+        self.inject_headers = inject_headers or {}
+        self.reverse_proxy = ReverseHttpProxy(client=_httpx_client, base_url=self.base_url)
+
+    def patch_headers(self, headers: HttpHeaders) -> HttpHeaders:
+        """Replace or add Authorization and any upstream-specific headers
+        when FORWARD_CLIENT_AUTH is disabled. Otherwise we leave Authorization as-is
+        but still add optional attribution headers for OpenRouter if not present.
+        """
+        def set_header(hdrs: HttpHeaders, name: str, value: str) -> HttpHeaders:
+            lname = name.lower().encode()
+            new: HttpHeaders = []
+            found = False
+            for k, v in hdrs:
+                if k.lower() == lname:
+                    if not found:
+                        new.append((k, value.encode()))
+                        found = True
+                    # skip duplicates
+                else:
+                    new.append((k, v))
+            if not found:
+                new.append((lname, value.encode()))
+            return new
+
+        patched = headers
+
+        # Authorization
+        if not settings.FORWARD_CLIENT_AUTH:
+            if not self.server_api_key:
+                raise HTTPException(status_code=500, detail=f"Server {self.name.upper()}_API_KEY not configured")
+            patched = set_header(patched, "authorization", f"Bearer {self.server_api_key}")
+
+        # Upstream-specific headers (e.g., OpenRouter attribution)
+        for k, v in self.inject_headers.items():
+            # Do not overwrite if client already set
+            lname = k.lower().encode()
+            if not any(hk.lower() == lname for hk, _ in patched):
+                patched = set_header(patched, k, v)
+
+        return patched
+
+    def normalize_path(self, raw_path: str) -> Tuple[str, str]:
+        """Return (proxied_path, target_url_for_logs).
+        Avoid duplicate prefixes like /v1/v1 or /api/v1/api/v1.
+        """
+        path = raw_path.lstrip("/") if raw_path else ""
+        base_no_slash = self.base_url.rstrip("/")
+
+        # If base ends with /v1 or /api/v1 and path starts with same segment, strip it once
+        if base_no_slash.endswith("/v1") and (path.startswith("v1/") or path == "v1"):
+            path = path[3:].lstrip("/")
+        if base_no_slash.endswith("/api/v1") and (path.startswith("api/v1/") or path == "api/v1"):
+            path = path[6:].lstrip("/")
+
+        target_url = f"{base_no_slash}/{path}" if path else self.base_url
+        return path, target_url
+
+
+# Shared httpx client / timeouts
 _httpx_timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=60.0)
 _httpx_client = httpx.AsyncClient(timeout=_httpx_timeout)
-reverse_proxy = ReverseHttpProxy(client=_httpx_client, base_url=settings.OPENAI_BASE_URL)
+
+# Compose upstreams
+openai_upstream = Upstream(
+    name="openai",
+    base_url=settings.OPENAI_BASE_URL,
+    server_api_key=settings.OPENAI_API_KEY,
+)
+
+openrouter_upstream = Upstream(
+    name="openrouter",
+    base_url=settings.OPENROUTER_BASE_URL,
+    server_api_key=settings.OPENROUTER_API_KEY,
+    inject_headers={
+        **({"HTTP-Referer": settings.OPENROUTER_HTTP_REFERER} if settings.OPENROUTER_HTTP_REFERER else {}),
+        **({"X-Title": settings.OPENROUTER_X_TITLE} if settings.OPENROUTER_X_TITLE else {}),
+    },
+)
+
+UPSTREAMS: Dict[str, Upstream] = {
+    "openai": openai_upstream,
+    "openrouter": openrouter_upstream,
+}
+
+
+def _pick_upstream(request: Request, explicit: Optional[str] = None) -> Upstream:
+    if explicit:
+        key = explicit.lower()
+        if key not in UPSTREAMS:
+            raise HTTPException(status_code=400, detail=f"Unknown upstream '{explicit}'")
+        return UPSTREAMS[key]
+
+    # header-based override
+    if settings.ALLOW_UPSTREAM_HEADER:
+        hdr = request.headers.get("x-upstream")
+        if hdr:
+            key = hdr.strip().lower()
+            if key in UPSTREAMS:
+                return UPSTREAMS[key]
+            raise HTTPException(status_code=400, detail=f"Unsupported x-upstream: {hdr}")
+
+    # default
+    return UPSTREAMS.get(settings.UPSTREAM_DEFAULT.lower(), openai_upstream)
+
 
 @app.on_event("shutdown")
 async def _shutdown_httpx_client():
@@ -119,9 +263,25 @@ async def _shutdown_httpx_client():
     except Exception:
         pass
 
+
+# =====================================================
+# Admin & health
+# =====================================================
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+@app.get("/_meta/upstreams")
+async def upstreams_meta():
+    return {
+        name: {
+            "base_url": u.base_url,
+            "server_key": bool(u.server_api_key),
+        }
+        for name, u in UPSTREAMS.items()
+    }
+
 
 @app.post("/admin/reload-clients")
 async def reload_clients(request: Request):
@@ -132,78 +292,42 @@ async def reload_clients(request: Request):
     _client_tokens = _load_tokens(settings.CLIENTS_FILE)
     return {"reloaded": len(_client_tokens)}
 
-# Этот эндпоинт ловит всё после /v1/ и отдаёт в OpenAI, сохраняя стримы
-@app.api_route("/v1/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
-async def proxy_v1(request: Request, path: str = ""):
+
+# =====================================================
+# Core proxy handler
+# =====================================================
+async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] = None):
     start = time.perf_counter()
 
-    # Проверим клиентскую авторизацию
+    # Validate client auth (your proxy's client tokens)
     await _require_client(request)
 
-    # Подготовим заголовок Authorization для запроса к OpenAI
-    # По умолчанию используем серверный ключ (если не включен форвардинг)
-    headers = list(request.scope.get("headers", []))  # list[tuple[bytes, bytes]]
+    # Choose upstream
+    upstream = _pick_upstream(request, explicit=upstream_name)
 
-    def set_header(name: str, value: str):
-        lname = name.lower().encode()
-        new = []
-        found = False
-        for k, v in headers:
-            if k.lower() == lname:
-                if not found:
-                    new.append((k, value.encode()))
-                    found = True
-                # пропускаем дубликаты
-            else:
-                new.append((k, v))
-        if not found:
-            new.append((lname, value.encode()))
-        return new
+    # Prepare headers for upstream
+    headers: HttpHeaders = list(request.scope.get("headers", []))
+    patched_headers = upstream.patch_headers(headers)
 
-    if not settings.FORWARD_CLIENT_AUTH:
-        if not settings.OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="Server OPENAI_API_KEY not configured")
-        headers = set_header("authorization", f"Bearer {settings.OPENAI_API_KEY}")
-        # Также полезно удалить любые клиентские api_key поля из тела — оставим это на апстрим
-
-    # Создаём новый Request с модифицированными заголовками
+    # Create new Request with modified headers
     scope = dict(request.scope)
-    scope["headers"] = headers
+    scope["headers"] = patched_headers
     patched_request = StarletteRequest(scope, request.receive)
 
-    # Отдаём в прокси (SSE/стрим пробрасывается fastapi-proxy-lib)
-    # Логируем целевой upstream URL для диагностики
-    try:
-        # Соберём целевой URL (без лишних двойных слэшей)
-        # Нормализуем базовый URL и путь, чтобы защититься от конфигурации клиента,
-        # которая уже включает /v1 в base_url и при этом SDK шлёт пути вида /v1/...
-        base_no_slash = settings.OPENAI_BASE_URL.rstrip("/")
-        normalized_path = path.lstrip("/") if path else ""
-        # Защита от дублирующего префикса: если базовый URL уже заканчивается на /v1
-        # и путь начинается с v1/, убираем ведущий "v1/" чтобы не получить /v1/v1/...
-        if base_no_slash.endswith("/v1") and normalized_path.startswith("v1/"):
-            normalized_path = normalized_path[len("v1/"):]
-            logger.info("removed duplicate /v1 from path; proxied path is now: %s", normalized_path or "<root>")
-        if normalized_path:
-            target_url = base_no_slash + "/" + normalized_path
-        else:
-            # Если путь пустой — используем исходный OPENAI_BASE_URL (чтобы сохранить поведение со слэшем на конце)
-            target_url = settings.OPENAI_BASE_URL
-        logger.info("proxying %s -> %s", request.method, target_url)
+    # Normalize path and compute target URL for logs
+    proxied_path, target_url = upstream.normalize_path(raw_path)
+    logger.info("[%s] proxying %s -> %s", upstream.name, request.method, target_url)
 
-        # Передаём исходный path (не normalized_path) в reverse_proxy,
-        # чтобы оно правильно построило upstream-путь на основании scope/headers.
-        # Если мы удалили из path префикс v1, передаём обновлённый путь чтобы прокси не форсировал двойной v1.
-        proxied_path = normalized_path
-        response = await reverse_proxy.proxy(request=patched_request, path=proxied_path)
+    try:
+        response = await upstream.reverse_proxy.proxy(request=patched_request, path=proxied_path)
     except httpx.ReadTimeout:
-        logger.warning("upstream read timeout while proxying /v1/%s", path)
+        logger.warning("upstream read timeout while proxying [%s] %s", upstream.name, raw_path)
         raise HTTPException(status_code=504, detail="Upstream read timeout")
     except Exception:
-        logger.exception("proxy error while handling /v1/%s", path)
+        logger.exception("proxy error while handling [%s] %s", upstream.name, raw_path)
         raise HTTPException(status_code=502, detail="Upstream error")
 
-    # При ошибочных статусах попробуем логировать тело ответа (предварительный просмотр)
+    # If error status, try to preview body for diagnostics
     try:
         status = getattr(response, "status_code", None)
         if status and status >= 400:
@@ -211,7 +335,6 @@ async def proxy_v1(request: Request, path: str = ""):
             try:
                 body = getattr(response, "body", None)
                 if body is None:
-                    # Могут быть стриминговые ответы — пометим как streaming
                     body_preview = "<streaming or no body>"
                 else:
                     if isinstance(body, (bytes, bytearray)):
@@ -220,28 +343,57 @@ async def proxy_v1(request: Request, path: str = ""):
                         body_preview = str(body)[:1000]
             except Exception as e:
                 body_preview = f"<body read failed: {e}>"
-            logger.warning("upstream response %s for /v1/%s -> %s : %s", status, path, target_url, body_preview)
+            logger.warning("upstream response %s for [%s] %s -> %s : %s", status, upstream.name, raw_path, target_url, body_preview)
     except Exception:
-        # Нельзя ломать проксирование логированием
         pass
 
-    # Лог
+    # Access log
     try:
-        auth_in = request.headers.get("authorization")
-        await _log({
-            "ts": int(time.time()*1000),
-            "method": request.method,
-            "path": f"/v1/{path}",
-            "status": getattr(response, "status_code", None),
-            "duration_ms": round((time.perf_counter() - start)*1000, 2),
-            "client_auth": _redact(auth_in) if auth_in else None,
-            "mode": "forward" if settings.FORWARD_CLIENT_AUTH else "server-key"
-        })
+        client_auth = request.headers.get("authorization")
+        await _log(
+            {
+                "ts": int(time.time() * 1000),
+                "method": request.method,
+                "path": f"/{raw_path}",
+                "upstream": upstream.name,
+                "status": getattr(response, "status_code", None),
+                "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                "client_auth": _redact(client_auth) if client_auth else None,
+                "mode": "forward" if settings.FORWARD_CLIENT_AUTH else "server-key",
+            }
+        )
     except Exception:
         pass
 
     return response
 
+
+# =====================================================
+# Routes
+# =====================================================
+# 1) Backward-compatible: client points SDK base_url to /v1 and chooses upstream via header `x-upstream`
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def proxy_v1(request: Request, path: str = ""):
+    return await _proxy(request, f"v1/{path}" if path else "v1", None)
+
+
+# 2) Explicit OpenAI path (optional convenience)
+@app.api_route("/openai/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def proxy_openai(request: Request, path: str = ""):
+    # Allows base_url like "/openai/v1" or "/openai/" — we pass raw path through
+    return await _proxy(request, path, "openai")
+
+
+# 3) Explicit OpenRouter path (optional convenience)
+@app.api_route("/openrouter/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def proxy_openrouter(request: Request, path: str = ""):
+    # Allows base_url like "/openrouter/api/v1" or "/openrouter/v1" — normalize accordingly
+    return await _proxy(request, path, "openrouter")
+
+
 @app.get("/")
 async def root():
-    return {"message": "OpenAI Reverse Proxy — set your SDK base_url to /v1"}
+    return {
+        "message": "Reverse Proxy ready. Use /v1 (OpenAI-compatible). Choose upstream via x-upstream header or use /openai/* or /openrouter/* base URLs.",
+        "default_upstream": settings.UPSTREAM_DEFAULT,
+    }
