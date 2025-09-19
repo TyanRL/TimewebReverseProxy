@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse # type: ignore
 class Settings(BaseSettings):
     # --- Upstreams ---
     OPENAI_BASE_URL: str = "https://api.openai.com/v1/"  # keep trailing slash
-    OPENAI_API_KEY: Optional[str] = None                 # used if FORWARD_CLIENT_AUTH=false
+    OPENAI_API_KEY: Optional[str] = None                 # server-side API key used by proxy for private monitel tokens or when no client token provided
 
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/"  # keep trailing slash
     OPENROUTER_API_KEY: Optional[str] = None
@@ -41,9 +41,9 @@ class Settings(BaseSettings):
     ALLOW_BEARER_FROM_AUTH_HEADER: bool = True
     CLIENT_HEADER_NAME: str = "x-api-key"  # alternative header for client tokens
 
-    # If true, forward the client's Authorization header to the upstream as-is
-    # If false, replace Authorization with server-side API key for the chosen upstream
-    FORWARD_CLIENT_AUTH: bool = False
+    # Adaptive client auth:
+    # If client token starts with monitel: it is a private key and must be present in clients.json.
+    # Otherwise the token is treated as an upstream API key and will be forwarded to the upstream.
 
     # --- HTTP client timeouts & transport ---
     HTTP_TIMEOUT_CONNECT: float = 20.0
@@ -260,8 +260,13 @@ async def _require_client(request: Request) -> Optional[str]:
         token = auth.split(" ", 1)[1]
     if not token:
         raise HTTPException(status_code=401, detail="Missing client token")
-    if token not in _client_tokens:
-        raise HTTPException(status_code=403, detail="Invalid client token")
+
+    # If token is a private monitel token, require it to be present in clients.json
+    if isinstance(token, str) and token.startswith("monitel:"):
+        if token not in _client_tokens:
+            raise HTTPException(status_code=403, detail="Invalid client token")
+
+    # Otherwise treat token as an upstream API key and allow it (pass-through)
     return token
 
 
@@ -311,10 +316,12 @@ class Upstream:
             cleaned.append((k, v))
         return cleaned
 
-    def patch_headers(self, headers: HttpHeaders) -> HttpHeaders:
-        """Replace or add Authorization and any upstream-specific headers
-        when FORWARD_CLIENT_AUTH is disabled. Otherwise we leave Authorization as-is
-        but still add optional attribution headers for OpenRouter if not present.
+    def patch_headers(self, headers: HttpHeaders, client_token: Optional[str] = None) -> HttpHeaders:
+        """Adaptive Authorization header handling:
+        - If client_token is None: use server API key as Authorization.
+        - If client_token starts with monitel: treat as private token; do not forward it upstream, use server API key.
+        - Otherwise: treat client_token as upstream API key and forward it as Authorization: Bearer <token>.
+        Upstream-specific inject_headers are still added if not set by the client.
         """
         def set_header(hdrs: HttpHeaders, name: str, value: str) -> HttpHeaders:
             lname = name.lower().encode()
@@ -334,11 +341,21 @@ class Upstream:
 
         patched = headers
 
-        # Authorization
-        if not settings.FORWARD_CLIENT_AUTH:
+        # Authorization: decide based on client_token
+        if client_token is None:
+            # No client token provided -> use server-side API key
             if not self.server_api_key:
                 raise HTTPException(status_code=500, detail=f"Server {self.name.upper()}_API_KEY not configured")
             patched = set_header(patched, "authorization", f"Bearer {self.server_api_key}")
+        else:
+            if isinstance(client_token, str) and client_token.startswith("monitel:"):
+                # Private key: do not forward, use server key
+                if not self.server_api_key:
+                    raise HTTPException(status_code=500, detail=f"Server {self.name.upper()}_API_KEY not configured")
+                patched = set_header(patched, "authorization", f"Bearer {self.server_api_key}")
+            else:
+                # Treat client_token as upstream API key and forward it
+                patched = set_header(patched, "authorization", f"Bearer {client_token}")
 
         # Upstream-specific headers (e.g., OpenRouter attribution)
         for k, v in self.inject_headers.items():
@@ -463,14 +480,14 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
     start = time.perf_counter()
 
     # Validate client auth (your proxy's client tokens)
-    await _require_client(request)
+    token = await _require_client(request)
 
     # Choose upstream
     upstream = _pick_upstream(request, explicit=upstream_name)
 
     # Prepare headers for upstream
     headers: HttpHeaders = list(request.scope.get("headers", []))
-    patched_headers = upstream.patch_headers(headers)
+    patched_headers = upstream.patch_headers(headers, token)
 
     # Create new Request with modified headers
     scope = dict(request.scope)
@@ -513,6 +530,13 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
     # Access log
     try:
         client_auth = request.headers.get("authorization")
+        # Determine adaptive mode for logging
+        if token is None:
+            mode = "adaptive:server-key"
+        elif isinstance(token, str) and token.startswith("monitel:"):
+            mode = "adaptive:monitel"
+        else:
+            mode = "adaptive:pass-through"
         await _log(
             {
                 "ts": int(time.time() * 1000),
@@ -522,7 +546,7 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
                 "status": getattr(response, "status_code", None),
                 "duration_ms": round((time.perf_counter() - start) * 1000, 2),
                 "client_auth": _redact(client_auth) if client_auth else None,
-                "mode": "forward" if settings.FORWARD_CLIENT_AUTH else "server-key",
+                "mode": mode,
             }
         )
     except Exception:
