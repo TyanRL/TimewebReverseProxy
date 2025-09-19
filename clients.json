@@ -1,5 +1,9 @@
-{
-  "tokens": [
-    "monitel:tyanrl_93119092025"
-  ]
-}
+[
+  {
+    "token": "monitel:tyanrl_93119092025",
+    "models": [
+      "gpt-5-mini",
+      "gpt-5-nano"
+    ]
+  }
+]

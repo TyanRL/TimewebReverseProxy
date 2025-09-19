@@ -212,24 +212,53 @@ except Exception:
 # Client tokens
 # =====================================================
 _client_tokens: set[str] = set()
+_client_allowed_models: Dict[str, set[str]] = {}
 
 
-def _load_tokens(path: str) -> set[str]:
+def _load_clients(path: str) -> Tuple[set[str], Dict[str, set[str]]]:
     p = Path(path)
     if not p.exists():
-        return set()
+        return set(), {}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and "tokens" in data:
-            return set(map(str, data.get("tokens", [])))
+        tokens: set[str] = set()
+        allowed: Dict[str, set[str]] = {}
+
+        # New extended format: list of objects [{"token":"monitel:...","models":["gpt-4", ...]}, ...]
         if isinstance(data, list):
-            return set(map(str, data))
+            # If list contains dicts with token+models
+            if data and all(isinstance(item, dict) for item in data):
+                for obj in data:
+                    tok = obj.get("token")
+                    if not tok:
+                        continue
+                    tok = str(tok)
+                    tokens.add(tok)
+                    models = obj.get("models")
+                    if isinstance(models, list):
+                        allowed[tok] = set(map(str, models))
+            else:
+                # Legacy: list of strings
+                tokens = set(map(str, data))
+        elif isinstance(data, dict):
+            # Legacy dict with "tokens": [...]
+            if "tokens" in data and isinstance(data.get("tokens"), list):
+                tokens = set(map(str, data.get("tokens", [])))
+            else:
+                # Possibly a mapping token -> [models], e.g. {"monitel:abc": ["gpt-4"]}
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, list):
+                        tokens.add(k)
+                        allowed[k] = set(map(str, v))
+
+        return tokens, allowed
     except Exception as e:
         logger.error(f"clients file read failed: {e}")
-    return set()
+    return set(), {}
 
 
-_client_tokens = _load_tokens(settings.CLIENTS_FILE)
+# Initial load
+_client_tokens, _client_allowed_models = _load_clients(settings.CLIENTS_FILE)
 
 # =====================================================
 # Utils
@@ -468,8 +497,8 @@ async def reload_clients(request: Request):
     admin_token = os.getenv("ADMIN_TOKEN")
     if request.headers.get("x-admin-token") != admin_token or not admin_token:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    global _client_tokens
-    _client_tokens = _load_tokens(settings.CLIENTS_FILE)
+    global _client_tokens, _client_allowed_models
+    _client_tokens, _client_allowed_models = _load_clients(settings.CLIENTS_FILE)
     return {"reloaded": len(_client_tokens)}
 
 
@@ -487,6 +516,34 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
 
     # Prepare headers for upstream
     headers: HttpHeaders = list(request.scope.get("headers", []))
+
+    # Model filter for private monitel tokens
+    model = request.query_params.get("model")
+    if isinstance(token, str) and token.startswith("monitel:") and token in _client_allowed_models:
+        allowed_models = _client_allowed_models.get(token, set())
+        if model:
+            # Case-insensitive comparison for robustness
+            allowed_lower = {m.lower() for m in allowed_models}
+            if model.lower() not in allowed_lower:
+                logger.warning("forbidden model attempt: %s by client %s", model, _redact(token))
+                try:
+                    await _log(
+                        {
+                            "ts": int(time.time() * 1000),
+                            "method": request.method,
+                            "path": f"/{raw_path}",
+                            "upstream": upstream.name,
+                            "status": 403,
+                            "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                            "client_token": _redact(token),
+                            "reason": "model not allowed",
+                            "model": model,
+                        }
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=403, detail="Model not allowed")
+
     patched_headers = upstream.patch_headers(headers, token)
 
     # Create new Request with modified headers
