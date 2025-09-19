@@ -518,13 +518,35 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
     headers: HttpHeaders = list(request.scope.get("headers", []))
 
     # Model filter for private monitel tokens
+    # First, try to get model from query params (legacy), then fall back to JSON body.
     model = request.query_params.get("model")
+ 
+    # Read body so we can detect model inside JSON body and also replay body to upstream.
+    body_bytes = b""
+    try:
+        body_bytes = await request.body()
+    except Exception:
+        body_bytes = b""
+ 
+    body_model = None
+    if body_bytes:
+        try:
+            data = json.loads(body_bytes)
+            if isinstance(data, dict):
+                body_model = data.get("model", None)
+        except Exception:
+            body_model = None
+ 
+    # prefer query param, fallback to body
+    if not model and body_model:
+        model = body_model
+ 
     if isinstance(token, str) and token.startswith("monitel:") and token in _client_allowed_models:
         allowed_models = _client_allowed_models.get(token, set())
         if model:
             # Case-insensitive comparison for robustness
             allowed_lower = {m.lower() for m in allowed_models}
-            if model.lower() not in allowed_lower:
+            if isinstance(model, str) and model.lower() not in allowed_lower:
                 logger.warning("forbidden model attempt: %s by client %s", model, _redact(token))
                 try:
                     await _log(
@@ -543,14 +565,19 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
                 except Exception:
                     pass
                 raise HTTPException(status_code=403, detail="Model not allowed")
-
+ 
     patched_headers = upstream.patch_headers(headers, token)
-
-    # Create new Request with modified headers
+ 
+    # Create new Request with modified headers, replaying body we already read
     scope = dict(request.scope)
     scope["headers"] = patched_headers
-    patched_request = StarletteRequest(scope, request.receive)
-
+    if body_bytes:
+        async def _receive() -> dict:
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        patched_request = StarletteRequest(scope, _receive)
+    else:
+        patched_request = StarletteRequest(scope, request.receive)
+ 
     # Normalize path and compute target URL for logs
     proxied_path, target_url = upstream.normalize_path(raw_path)
     logger.info("[%s] proxying %s -> %s", upstream.name, request.method, target_url)
