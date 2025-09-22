@@ -1,3 +1,4 @@
+import os
 from pydantic_settings import BaseSettings
 from typing import Optional
 
@@ -22,9 +23,13 @@ class Settings(BaseSettings):
 
     # --- Client auth for your proxy layer ---
     AUTH_ENABLED: bool = True
-    CLIENTS_FILE: str = "clients.json"  # json: {"tokens":["..."]} or ["..."]
+    CLIENTS_FILE: Optional[str] = "clients.json"  # json: {"tokens":["..."]} or ["..."]
     ALLOW_BEARER_FROM_AUTH_HEADER: bool = True
     CLIENT_HEADER_NAME: str = "x-api-key"  # alternative header for client tokens
+
+    # Environment-based client configuration
+    CLIENT_TOKENS: Optional[str] = None  # CSV list of client tokens from env
+    CLIENT_TOKENS_JSON: Optional[str] = None  # JSON string with client configs from env
 
     # Adaptive client auth:
     # If client token starts with monitel: it is a private key and must be present in clients.json.

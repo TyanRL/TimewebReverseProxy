@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Set
 
@@ -9,6 +10,44 @@ from .utils import logger
 
 _client_tokens: Set[str] = set()
 _client_allowed_models: Dict[str, Set[str]] = {}
+
+
+def load_clients_from_env() -> Tuple[Set[str], Dict[str, Set[str]]]:
+    """Load clients from environment variables."""
+    tokens = set()
+    allowed_models = {}
+
+    # Загрузка из CSV переменной CLIENT_TOKENS
+    if settings.CLIENT_TOKENS:
+        csv_tokens = [t.strip() for t in settings.CLIENT_TOKENS.split(',')]
+        for token in csv_tokens:
+            if token:
+                tokens.add(token)
+                # Поиск ограничений по моделям для этого токена
+                for key, value in os.environ.items():
+                    if key.startswith('CLIENT_TOKEN_') and key.endswith('_MODELS'):
+                        token_key = key.replace('_MODELS', '')
+                        env_token = os.environ.get(token_key)
+                        if env_token == token:
+                            models = [m.strip() for m in value.split(',')]
+                            allowed_models[token] = set(models)
+                            break
+
+    # Загрузка из JSON переменной CLIENT_TOKENS_JSON (переопределение)
+    if settings.CLIENT_TOKENS_JSON:
+        try:
+            data = json.loads(settings.CLIENT_TOKENS_JSON)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and 'token' in item:
+                        token = item['token']
+                        tokens.add(token)
+                        if 'models' in item and isinstance(item['models'], list):
+                            allowed_models[token] = set(item['models'])
+        except Exception as e:
+            logger.error(f"Failed to parse CLIENT_TOKENS_JSON: {e}")
+
+    return tokens, allowed_models
 
 
 def load_clients(path: str) -> Tuple[Set[str], Dict[str, Set[str]]]:
@@ -56,20 +95,41 @@ def load_clients(path: str) -> Tuple[Set[str], Dict[str, Set[str]]]:
 
 def _initial_load() -> None:
     global _client_tokens, _client_allowed_models
-    _client_tokens, _client_allowed_models = load_clients(settings.CLIENTS_FILE)
+
+    # Сначала загружаем из переменных окружения
+    env_tokens, env_models = load_clients_from_env()
+
+    # Затем из файла, если он существует
+    file_tokens, file_models = set(), {}
+    if settings.CLIENTS_FILE:
+        file_tokens, file_models = load_clients(settings.CLIENTS_FILE)
+
+    # Объединяем результаты (переменные окружения имеют приоритет)
+    _client_tokens = env_tokens or file_tokens
+    _client_allowed_models = {**file_models, **env_models}
 
 
 _initial_load()
 
 
 def reload_clients() -> int:
-    """Reload clients.json into module state. Returns number of tokens loaded."""
+    """Reload clients from environment and file into module state. Returns number of tokens loaded."""
     global _client_tokens, _client_allowed_models
-    tokens, allowed = load_clients(settings.CLIENTS_FILE)
+
+    # Загружаем из переменных окружения (всегда актуально)
+    env_tokens, env_models = load_clients_from_env()
+
+    # Загружаем из файла, если он существует
+    file_tokens, file_models = set(), {}
+    if settings.CLIENTS_FILE:
+        file_tokens, file_models = load_clients(settings.CLIENTS_FILE)
+
+    # Объединяем результаты (переменные окружения имеют приоритет)
     _client_tokens.clear()
-    _client_tokens.update(tokens)
+    _client_tokens.update(env_tokens or file_tokens)
     _client_allowed_models.clear()
-    _client_allowed_models.update(allowed)
+    _client_allowed_models.update({**file_models, **env_models})
+
     return len(_client_tokens)
 
 
