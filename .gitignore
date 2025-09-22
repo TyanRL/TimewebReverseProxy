@@ -84,3 +84,5 @@ Thumbs.db
 # pixi
 .pixi/
 *.lock
+
+clients.json
