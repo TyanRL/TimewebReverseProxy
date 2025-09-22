@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import Request from fastapi import HTTPException, Request #type: ignore
+from fastapi import HTTPException, Request #type: ignore
 
 from .settings import settings
 
