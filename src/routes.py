@@ -66,9 +66,27 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
             except Exception:
                 pass
             raise HTTPException(status_code=403, detail="Model not allowed")
-    except Exception:
-        # fail-open on errors during model checks
-        pass
+    except Exception as e:
+        # fail-closed on errors during model checks - log and reject
+        logger.exception("model validation error for client %s, model %s: %s", _redact(token), model, str(e))
+        try:
+            await _log(
+                {
+                    "ts": int(time.time() * 1000),
+                    "method": request.method,
+                    "path": f"/{raw_path}",
+                    "upstream": upstream.name,
+                    "status": 500,
+                    "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                    "client_token": _redact(token),
+                    "reason": "model validation error",
+                    "model": model,
+                    "error": str(e),
+                }
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Internal server error during model validation")
 
     patched_headers = upstream.patch_headers(headers, token)
 
