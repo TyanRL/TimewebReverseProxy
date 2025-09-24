@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     HTTP_TIMEOUT_POOL: float = 120.0
     HTTP2_ENABLED: bool = True
 
+    # Connection pool and environment behavior
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 100
+    HTTP_MAX_CONNECTIONS: int = 200
+    HTTP_KEEPALIVE_EXPIRY: float = 30.0
+    HTTP_TRUST_ENV: bool = False
+
+    # --- Request parsing ---
+    REQUEST_JSON_PARSE_MAX_BYTES: int = 65536
+
     # --- Logging ---
     LOG_JSONL_PATH: str = "logs/requests.jsonl"
     ACCESS_LOG_NOISE_FILTER: bool = True  # suppress common scanner noise in uvicorn.access

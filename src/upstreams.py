@@ -117,14 +117,24 @@ class Upstream:
         return path, target_url
 
 
-# Shared httpx client / timeouts
+# Shared httpx client / timeouts and limits
 _httpx_timeout = httpx.Timeout(
     connect=settings.HTTP_TIMEOUT_CONNECT,
     read=settings.HTTP_TIMEOUT_READ,
     write=settings.HTTP_TIMEOUT_WRITE,
     pool=settings.HTTP_TIMEOUT_POOL,
 )
-_httpx_client = httpx.AsyncClient(timeout=_httpx_timeout, http2=settings.HTTP2_ENABLED)
+_httpx_limits = httpx.Limits(
+    max_keepalive_connections=settings.HTTP_MAX_KEEPALIVE_CONNECTIONS,
+    max_connections=settings.HTTP_MAX_CONNECTIONS,
+    keepalive_expiry=settings.HTTP_KEEPALIVE_EXPIRY,
+)
+_httpx_client = httpx.AsyncClient(
+    timeout=_httpx_timeout,
+    http2=settings.HTTP2_ENABLED,
+    limits=_httpx_limits,
+    trust_env=settings.HTTP_TRUST_ENV,
+)
 
 
 # Compose upstreams

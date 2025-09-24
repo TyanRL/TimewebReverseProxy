@@ -1,5 +1,8 @@
 import json
 import logging
+import sys
+import queue
+from logging.handlers import QueueHandler, QueueListener
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,7 +16,22 @@ Path(settings.LOG_JSONL_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("proxy")
 logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
+logger.propagate = False
+
+# Non-blocking logging via queue to reduce sync stdout I/O
+_log_queue = queue.Queue(-1)
+_stream_handler = logging.StreamHandler(sys.stdout)
+_queue_handler = QueueHandler(_log_queue)
+_queue_listener = QueueListener(_log_queue, _stream_handler, respect_handler_level=True)
+
+# Avoid duplicate handlers on reload
+logger.handlers.clear()
+logger.addHandler(_queue_handler)
+try:
+    _queue_listener.start()
+except Exception:
+    # Fallback to direct stream handler if QueueListener fails
+    logger.addHandler(_stream_handler)
 
 
 def _csv_list(s: str) -> List[str]:
@@ -106,8 +124,9 @@ def _redact(v: Optional[str]) -> Optional[str]:
 
 
 async def _log(record: Dict):
-    try:
-        with open(settings.LOG_JSONL_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.error(f"log write failed: {e}")
+#    try:
+#        with open(settings.LOG_JSONL_PATH, "a", encoding="utf-8") as f:
+#            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+#    except Exception as e:
+#        logger.error(f"log write failed: {e}")
+    pass

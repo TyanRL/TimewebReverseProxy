@@ -25,21 +25,25 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
     # Model filter for private monitel tokens
     model = request.query_params.get("model")
 
-    # Read body so we can detect model inside JSON body and also replay body to upstream.
+    # Conditionally read body only for small JSON to detect model; keep streaming otherwise
     body_bytes = b""
+    body_model = None
     try:
-        body_bytes = await request.body()
+        content_type = request.headers.get("content-type", "").lower()
+        is_json = "application/json" in content_type
+        parse_limit = getattr(settings, "REQUEST_JSON_PARSE_MAX_BYTES", 65536)
+        cl_header = request.headers.get("content-length")
+        content_length = int(cl_header) if cl_header is not None and cl_header.isdigit() else None
+        if is_json and content_length is not None and content_length <= parse_limit:
+            body_bytes = await request.body()
+            try:
+                data = __import__("json").loads(body_bytes)
+                if isinstance(data, dict):
+                    body_model = data.get("model", None)
+            except Exception:
+                body_model = None
     except Exception:
         body_bytes = b""
-
-    body_model = None
-    if body_bytes:
-        try:
-            data = __import__("json").loads(body_bytes)
-            if isinstance(data, dict):
-                body_model = data.get("model", None)
-        except Exception:
-            body_model = None
 
     # prefer query param, fallback to body
     if not model and body_model:
