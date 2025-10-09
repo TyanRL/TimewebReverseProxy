@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from keep_alive_render import _keepalive_ping_loop
+from .keep_alive_render import _keepalive_ping_loop
 
 from .settings import settings
 from .utils import _csv_list, logger
