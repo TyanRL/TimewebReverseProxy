@@ -1,13 +1,48 @@
-from fastapi import FastAPI, Request, HTTPException #type: ignore
-from fastapi.middleware.cors import CORSMiddleware #type: ignore
-from fastapi.responses import JSONResponse #type: ignore
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from keep_alive_render import _keepalive_ping_loop
 
 from .settings import settings
 from .utils import _csv_list, logger
 from . import routes
 from .upstreams import shutdown_httpx_client
 
-app = FastAPI(title="Multi-Upstream Reverse Proxy (OpenAI + OpenRouter)")
+import asyncio
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    if settings.KEEPALIVE_PING_ENABLED and settings.KEEPALIVE_PING_URL:
+        try:
+            app.state._keepalive_task = asyncio.create_task(_keepalive_ping_loop())
+            logger.info(
+                "keepalive ping enabled: %s every %ss",
+                settings.KEEPALIVE_PING_URL,
+                settings.KEEPALIVE_PING_INTERVAL_SECONDS,
+            )
+        except Exception as e:
+            logger.error("failed to start keepalive task: %s", e)
+    # Yield control to application
+    try:
+        yield
+    finally:
+        # Shutdown: stop keepalive task
+        task = getattr(app.state, "_keepalive_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        # Shutdown shared httpx client(s)
+        await shutdown_httpx_client()
+
+
+app = FastAPI(title="Multi-Upstream Reverse Proxy (OpenAI + OpenRouter)", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,11 +75,6 @@ async def _allowlist_middleware(request: Request, call_next):
             return JSONResponse(status_code=settings.ALLOWLIST_DENY_CODE, content={"detail": settings.ALLOWLIST_DENY_MESSAGE})
 
     return await call_next(request)
-
-
-@app.on_event("shutdown")
-async def _shutdown_httpx_client():
-    await shutdown_httpx_client()
 
 
 # Register routes from module
