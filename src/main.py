@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -21,7 +22,7 @@ async def lifespan(app: FastAPI):
     if (not preflight) and settings.KEEPALIVE_PING_ENABLED and settings.KEEPALIVE_PING_URL:
         try:
             app.state._keepalive_task = asyncio.create_task(_keepalive_ping_loop())
-            logger.info(f"keepalive ping enabled: {settings.KEEPALIVE_PING_URL} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
+            logger.info(f"[{datetime.now()}] keepalive ping enabled: {settings.KEEPALIVE_PING_URL} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
         except Exception as e:
             logger.error(f"failed to start keepalive task: {e}")
     # Yield control to application
