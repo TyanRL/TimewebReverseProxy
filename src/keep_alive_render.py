@@ -1,3 +1,4 @@
+from datetime import datetime
 from .settings import settings
 from .utils import logger
 
@@ -24,11 +25,11 @@ async def _keepalive_ping_loop():
                     httpx = __import__("httpx")
                     async with httpx.AsyncClient(timeout=timeout) as client:
                         resp = await client.get(url, timeout=timeout)
-                logger.info("keepalive ping %s -> %s", url, getattr(resp, "status_code", None))
+                logger.info(f"[{datetime.now()}]keepalive ping {url} ->{getattr(resp, "status_code", None)}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("keepalive ping failed: %s", e)
+                logger.warning(f"keepalive ping failed: {e}")
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
