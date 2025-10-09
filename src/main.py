@@ -9,6 +9,7 @@ from .utils import _csv_list, logger
 from . import routes
 from .upstreams import shutdown_httpx_client
 
+import os
 import asyncio
 from contextlib import asynccontextmanager
 
@@ -16,16 +17,13 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    if settings.KEEPALIVE_PING_ENABLED and settings.KEEPALIVE_PING_URL:
+    preflight = os.getenv("PREFLIGHT") == "1"
+    if (not preflight) and settings.KEEPALIVE_PING_ENABLED and settings.KEEPALIVE_PING_URL:
         try:
             app.state._keepalive_task = asyncio.create_task(_keepalive_ping_loop())
-            logger.info(
-                "keepalive ping enabled: %s every %ss",
-                settings.KEEPALIVE_PING_URL,
-                settings.KEEPALIVE_PING_INTERVAL_SECONDS,
-            )
+            logger.info(f"keepalive ping enabled: {settings.KEEPALIVE_PING_URL} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
         except Exception as e:
-            logger.error("failed to start keepalive task: %s", e)
+            logger.error(f"failed to start keepalive task: {e}")
     # Yield control to application
     try:
         yield
