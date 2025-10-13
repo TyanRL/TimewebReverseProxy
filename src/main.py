@@ -14,6 +14,84 @@ import os
 import asyncio
 from contextlib import asynccontextmanager
 
+# Cross-process singleton lock to ensure only one keepalive task across gunicorn workers
+def _acquire_keepalive_singleton(lock_filename: str):
+    try:
+        import os, tempfile
+        lock_dir = tempfile.gettempdir()
+        lock_path = lock_filename if os.path.isabs(lock_filename) else os.path.join(lock_dir, lock_filename)
+        if os.name == "nt":
+            import msvcrt
+            f = open(lock_path, "a+")
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
+                    f.seek(0); f.truncate()
+                    f.write(str(os.getpid()))
+                    f.flush()
+                except Exception:
+                    pass
+                return ("windows", f)
+            except OSError:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                return None
+        else:
+            import importlib
+            from typing import Any
+            fcntl = importlib.import_module("fcntl")  # type: ignore
+            f = open(lock_path, "a+")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+                try:
+                    f.seek(0); f.truncate()
+                    f.write(str(os.getpid()))
+                    f.flush()
+                except Exception:
+                    pass
+                return ("posix", f)
+            except OSError:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                return None
+    except Exception as e:
+        logger.warning(f"keepalive singleton acquire failed: {e}")
+        return None
+
+def _release_keepalive_singleton(lock):
+    try:
+        if not lock:
+            return
+        kind, handle = lock
+        if kind == "windows":
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+            try:
+                handle.close()
+            except Exception:
+                pass
+        else:
+            import importlib
+            from typing import Any
+            fcntl = importlib.import_module("fcntl")  # type: ignore
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                handle.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,8 +99,14 @@ async def lifespan(app: FastAPI):
     preflight = os.getenv("PREFLIGHT") == "1"
     if (not preflight) and settings.KEEPALIVE_PING_ENABLED and settings.KEEPALIVE_PING_URL:
         try:
-            app.state._keepalive_task = asyncio.create_task(_keepalive_ping_loop())
-            logger.info(f"[{datetime.now()}] keepalive ping enabled: {settings.KEEPALIVE_PING_URL} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
+            # Ensure only one worker creates the keepalive task
+            lock = _acquire_keepalive_singleton("keepalive-ping.lock")
+            if lock:
+                app.state._keepalive_lock = lock
+                app.state._keepalive_task = asyncio.create_task(_keepalive_ping_loop())
+                logger.info(f"[{datetime.now()}] keepalive ping enabled (singleton): {settings.KEEPALIVE_PING_URL} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
+            else:
+                logger.info(f"[{datetime.now()}] keepalive ping skipped in this worker (lock held by another process)")
         except Exception as e:
             logger.error(f"failed to start keepalive task: {e}")
     # Yield control to application
@@ -37,6 +121,12 @@ async def lifespan(app: FastAPI):
                 await task
             except Exception:
                 pass
+        # Release singleton lock if held
+        lock = getattr(app.state, "_keepalive_lock", None)
+        try:
+            _release_keepalive_singleton(lock)
+        except Exception:
+            pass
         # Shutdown shared httpx client(s)
         await shutdown_httpx_client()
 

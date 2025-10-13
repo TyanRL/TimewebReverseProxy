@@ -5,7 +5,7 @@ from .utils import logger
 async def _keepalive_ping_loop():
     asyncio = __import__("asyncio")
     url = settings.KEEPALIVE_PING_URL
-    url2 = settings.KEEPALIVE_PING_URL
+    url2 = settings.KEEPALIVE_PING_URL2
     interval = int(getattr(settings, "KEEPALIVE_PING_INTERVAL_SECONDS", 60) or 60)
     timeout = float(getattr(settings, "KEEPALIVE_PING_TIMEOUT", 10.0) or 10.0)
 
@@ -16,7 +16,7 @@ async def _keepalive_ping_loop():
     while True:
         if settings.KEEPALIVE_PING_ENABLED and url:
             health_url=f"{url}/health"
-            health_url2=f"{url}/health"
+            health_url2=f"{url2}/health"
             await ping(asyncio, timeout, health_url)
             await ping(asyncio, timeout, health_url2)
         try:
