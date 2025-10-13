@@ -16,7 +16,7 @@ async def _keepalive_ping_loop():
     while True:
         if settings.KEEPALIVE_PING_ENABLED and url:
             health_url=f"{url}/health"
-            health_url2=f"{url2}/health"
+            health_url2=f"{url2}/healthz"
             await ping(asyncio, timeout, health_url)
             await ping(asyncio, timeout, health_url2)
         try:
