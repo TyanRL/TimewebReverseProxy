@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: render-reverse-proxy
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 2 -b 0.0.0.0:$PORT "src.main:app"
+    healthCheckPath: /healthz
+    autoDeploy: true
+    pythonVersion: "3.11.9"
+    envVars:
+      - key: PREFLIGHT
+        value: "0"
+      - key: KEEPALIVE_PING_ENABLED
+        value: "False"
