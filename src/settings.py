@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     # --- Keepalive ping ---
     KEEPALIVE_PING_ENABLED: bool = True
     KEEPALIVE_PING_URL: Optional[str] = "https://telegram-bot-xmj4.onrender.com"
+    KEEPALIVE_PING_URL2: Optional[str] = "https://timewebreverseproxy.onrender.com"
     KEEPALIVE_PING_INTERVAL_SECONDS: int = 50
     KEEPALIVE_PING_TIMEOUT: float = 10.0
 

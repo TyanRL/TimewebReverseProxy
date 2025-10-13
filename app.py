@@ -1,0 +1,1 @@
+from src.main import app as app  # expose FastAPI app for "gunicorn app:app"
