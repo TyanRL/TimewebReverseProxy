@@ -1,8 +1,8 @@
 import time
-from typing import Optional
+from typing import Optional, Any, AsyncIterable, Iterable, cast
 
 from fastapi import FastAPI, HTTPException, Request #type: ignore
-from fastapi.responses import JSONResponse, PlainTextResponse #type: ignore
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse #type: ignore
 
 from .settings import settings
 from .auth import require_client, reload_clients as auth_reload_clients, is_model_allowed
@@ -119,6 +119,57 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
             raise HTTPException(status_code=504, detail="Upstream read timeout")
         logger.exception("proxy error while handling [%s] %s", upstream.name, raw_path)
         raise HTTPException(status_code=502, detail="Upstream error")
+
+    # Wrap streaming body to gracefully handle HTTP/2 stream resets during iteration
+    if hasattr(response, "body_iterator") and getattr(response, "body_iterator", None) is not None:
+        orig_iterator = getattr(response, "body_iterator")
+
+        async def _safe_stream():
+            iterator: Any = orig_iterator() if callable(orig_iterator) else orig_iterator
+            try:
+                if hasattr(iterator, "__aiter__"):
+                    async for chunk in cast(AsyncIterable[bytes], iterator):
+                        yield chunk
+                elif hasattr(iterator, "__iter__"):
+                    for chunk in cast(Iterable[bytes], iterator):
+                        yield chunk
+                else:
+                    # Unknown iterator type; nothing to stream
+                    return
+            except Exception as e:
+                # Swallow only HTTP/2 stream reset errors from upstream
+                try:
+                    import httpx as __httpx  # type: ignore
+                    if isinstance(e, __httpx.RemoteProtocolError):
+                        logger.warning("HTTP/2 stream reset from upstream [%s] %s -> %s: %s", upstream.name, raw_path, target_url, e)
+                        return
+                except Exception:
+                    pass
+                try:
+                    from httpcore import RemoteProtocolError as __HCRemoteProtocolError  # type: ignore
+                    if isinstance(e, __HCRemoteProtocolError):
+                        logger.warning("HTTP/2 stream reset from upstream [%s] %s -> %s: %s", upstream.name, raw_path, target_url, e)
+                        return
+                except Exception:
+                    pass
+                logger.exception("streaming error while proxying [%s] %s", upstream.name, raw_path)
+                raise
+
+        # Rebuild streaming response with preserved metadata
+        hdrs = dict(getattr(response, "headers", {}) or {})
+        # Prevent possible Content-Length mismatch if stream ends early
+        for _k in list(hdrs.keys()):
+            if _k.lower() == "content-length":
+                hdrs.pop(_k, None)
+                break
+
+        response = StreamingResponse(
+            _safe_stream(),
+            status_code=getattr(response, "status_code", 200),
+            headers=hdrs,
+            media_type=getattr(response, "media_type", None),
+            background=getattr(response, "background", None),
+        )
 
     # If error status, try to preview body for diagnostics
     try:

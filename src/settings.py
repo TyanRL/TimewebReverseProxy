@@ -43,9 +43,9 @@ class Settings(BaseSettings):
     HTTP2_ENABLED: bool = True
 
     # Connection pool and environment behavior
-    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 100
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 20
     HTTP_MAX_CONNECTIONS: int = 200
-    HTTP_KEEPALIVE_EXPIRY: float = 30.0
+    HTTP_KEEPALIVE_EXPIRY: float = 20.0
     HTTP_TRUST_ENV: bool = False
 
     # --- Request parsing ---
@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # --- Keepalive ping ---
     KEEPALIVE_PING_ENABLED: bool = True
     KEEPALIVE_PING_URL: Optional[str] = "https://telegram-bot-xmj4.onrender.com"
-    KEEPALIVE_PING_URL2: Optional[str] = "https://timewebreverseproxy.onrender.com"
+    KEEPALIVE_PING_URL2: Optional[str] = "https://myreverseproxy.onrender.com"
     KEEPALIVE_PING_INTERVAL_SECONDS: int = 50
     KEEPALIVE_PING_TIMEOUT: float = 10.0
 
