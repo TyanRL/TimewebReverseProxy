@@ -1,6 +1,24 @@
-from datetime import datetime
+from datetime import datetime, time
 from .settings import settings
 from .utils import logger
+
+# Europe/Moscow timezone handling
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None  # Fallback to fixed UTC+3 if zoneinfo is unavailable
+
+def _moscow_now():
+    if ZoneInfo is not None:
+        return datetime.now(ZoneInfo("Europe/Moscow"))
+    # Fallback: fixed offset (MSK UTC+3, no DST)
+    from datetime import timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=3)))
+
+def _within_hours_msk(start_hour: int, end_hour: int) -> bool:
+    """Return True when current time in MSK is within [start_hour, end_hour)."""
+    now_t = _moscow_now().time()
+    return time(hour=start_hour) <= now_t < time(hour=end_hour)
 
 async def _keepalive_ping_loop():
     asyncio = __import__("asyncio")
@@ -14,12 +32,18 @@ async def _keepalive_ping_loop():
         interval = 15
 
     while True:
-        if settings.KEEPALIVE_PING_ENABLED and url:
-            health_url=f"{url}/health"
-            health_url2=f"{url2}/healthz"
-            await ping(asyncio, timeout, health_url)
-            await ping(asyncio, timeout, health_url2)
         try:
+            if settings.KEEPALIVE_PING_ENABLED:
+                # URL1: ping 08:00 <= MSK < 23:00
+                if url and _within_hours_msk(9, 22):
+                    health_url = f"{url}/health"
+                    await ping(asyncio, timeout, health_url)
+
+                # URL2: ping 08:00 <= MSK < 21:00
+                if url2 and _within_hours_msk(8, 20):
+                    health_url2 = f"{url2}/healthz"
+                    await ping(asyncio, timeout, health_url2)
+
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
