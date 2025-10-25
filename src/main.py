@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
             if lock:
                 app.state._keepalive_lock = lock
                 app.state._keepalive_task = asyncio.create_task(_keepalive_ping_loop())
-                logger.info(f"[{datetime.now()}] keepalive ping enabled (singleton): {settings.KEEPALIVE_PING_URL} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
+                logger.info(f"[{datetime.now()}] keepalive ping enabled (singleton): {settings.KEEPALIVE_PING_URL} and {settings.KEEPALIVE_PING_URL2} every {settings.KEEPALIVE_PING_INTERVAL_SECONDS}")
             else:
                 logger.info(f"[{datetime.now()}] keepalive ping skipped in this worker (lock held by another process)")
         except Exception as e:
