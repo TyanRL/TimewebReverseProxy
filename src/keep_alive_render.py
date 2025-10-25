@@ -9,8 +9,12 @@ except Exception:
     ZoneInfo = None  # Fallback to fixed UTC+3 if zoneinfo is unavailable
 
 def _moscow_now():
-    if ZoneInfo is not None:
-        return datetime.now(ZoneInfo("Europe/Moscow"))
+    # Try real timezone first; if tzdata missing or ZoneInfo raises -> fallback to fixed UTC+3
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("Europe/Moscow"))
+    except Exception:
+        pass
     # Fallback: fixed offset (MSK UTC+3, no DST)
     from datetime import timezone, timedelta
     return datetime.now(timezone(timedelta(hours=3)))
@@ -34,21 +38,30 @@ async def _keepalive_ping_loop():
     while True:
         try:
             if settings.KEEPALIVE_PING_ENABLED:
-                # URL1: ping 08:00 <= MSK < 23:00
-                if url and _within_hours_msk(9, 22):
-                    health_url = f"{url}/health"
-                    await ping(asyncio, timeout, health_url)
+                # URL1: ping 08:00 <= MSK < 23:00 (guard time-window exceptions to not block URL2)
+                if url:
+                    try:
+                        if _within_hours_msk(9, 22):
+                            health_url = f"{url}/health"
+                            await ping(asyncio, timeout, health_url)
+                    except Exception as e:
+                        logger.warning(f"keepalive time-window check failed: {e}")
 
-                # URL2: ping 08:00 <= MSK < 21:00
-                #if url2 and _within_hours_msk(7, 23):
-                health_url2 = f"{url2}/healthz"
-                await ping(asyncio, timeout, health_url2)
-
-            await asyncio.sleep(interval)
+                # URL2: always attempt when configured (independent from URL1 result)
+                if url2:
+                    health_url2 = f"{url2}/healthz"
+                    await ping(asyncio, timeout, health_url2)
         except asyncio.CancelledError:
             raise
         except Exception:
+            # Swallow any unexpected error to keep the loop alive
             pass
+        finally:
+            try:
+                await asyncio.sleep(interval)
+            except Exception:
+                # If sleep fails for some reason, do not tight-loop
+                pass
 
 async def ping(asyncio, timeout, health_url):
     try:
