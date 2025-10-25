@@ -35,11 +35,12 @@ async def _keepalive_ping_loop():
         try:
             if settings.KEEPALIVE_PING_ENABLED:
                 # URL1: ping 08:00 <= MSK < 23:00
-                if url and _within_hours_msk(11, 23):
+                if url and _within_hours_msk(9, 22):
                     health_url = f"{url}/health"
                     await ping(asyncio, timeout, health_url)
 
                 # URL2: ping 08:00 <= MSK < 21:00
+                #if url2 and _within_hours_msk(7, 23):
                 health_url2 = f"{url2}/healthz"
                 await ping(asyncio, timeout, health_url2)
 
