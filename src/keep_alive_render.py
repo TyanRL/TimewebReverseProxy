@@ -38,15 +38,11 @@ async def _keepalive_ping_loop():
     while True:
         try:
             if settings.KEEPALIVE_PING_ENABLED:
-                # URL1: ping 08:00 <= MSK < 23:00 (guard time-window exceptions to not block URL2)
+                # URL1: ping 
                 if url:
-                    try:
-                        if _within_hours_msk(9, 22):
-                            health_url = f"{url}/health"
-                            await ping(asyncio, timeout, health_url)
-                    except Exception as e:
-                        logger.warning(f"keepalive time-window check failed: {e}")
-
+                    health_url = f"{url}/health"
+                    await ping(asyncio, timeout, health_url)
+                    
                 # URL2: always attempt when configured (independent from URL1 result)
                 if url2:
                     health_url2 = f"{url2}/healthz"
