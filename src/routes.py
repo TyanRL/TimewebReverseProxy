@@ -1,4 +1,6 @@
 import time
+import hmac
+import os
 from typing import Optional, Any, AsyncIterable, Iterable, cast
 
 from fastapi import FastAPI, HTTPException, Request #type: ignore
@@ -70,6 +72,8 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
             except Exception:
                 pass
             raise HTTPException(status_code=403, detail="Model not allowed")
+    except HTTPException:
+        raise
     except Exception as e:
         # fail-closed on errors during model checks - log and reject
         logger.exception("model validation error for client %s, model %s: %s", _redact(token), model, str(e))
@@ -220,13 +224,24 @@ async def _proxy(request: Request, raw_path: str, upstream_name: Optional[str] =
 
 
 def register_routes(app: FastAPI):
+    async def require_admin(request: Request, allow_when_unconfigured: bool = False) -> None:
+        configured = settings.ADMIN_TOKEN or os.getenv("ADMIN_TOKEN")
+        if not configured and allow_when_unconfigured:
+            return
+        supplied = request.headers.get("x-admin-token", "")
+        if not configured or not hmac.compare_digest(supplied, configured):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     # Admin & health
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}
 
     @app.get("/_meta/upstreams")
-    async def upstreams_meta():
+    async def upstreams_meta(request: Request):
+        # Preserve existing deployments without ADMIN_TOKEN, but protect metadata
+        # automatically once an admin secret is configured.
+        await require_admin(request, allow_when_unconfigured=True)
         return {
             name: {
                 "base_url": u.base_url,
@@ -237,9 +252,7 @@ def register_routes(app: FastAPI):
 
     @app.post("/admin/reload-clients")
     async def reload_clients(request: Request):
-        admin_token = __import__("os").getenv("ADMIN_TOKEN")
-        if request.headers.get("x-admin-token") != admin_token or not admin_token:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        await require_admin(request)
         reloaded = auth_reload_clients()
         return {"reloaded": reloaded}
 

@@ -42,6 +42,10 @@ class Upstream:
             b"proxy-authorization",
             b"host",
             b"content-length",
+            b"authorization",
+            b"x-api-key",
+            b"x-admin-token",
+            b"x-upstream",
         }
         cleaned: HttpHeaders = []
         for k, v in headers:
@@ -73,7 +77,8 @@ class Upstream:
                 new.append((lname, value.encode()))
             return new
 
-        patched = headers
+        # Rebuild credentials below; never forward client auth or routing headers.
+        patched = self.sanitize_headers(headers)
 
         # Authorization: decide based on client_token
         if client_token is None:

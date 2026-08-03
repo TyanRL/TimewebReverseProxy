@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     ALLOW_UPSTREAM_HEADER: bool = True
 
     # --- Client auth for your proxy layer ---
-    AUTH_ENABLED: bool = True
+    AUTH_ENABLED: bool = False
     CLIENTS_FILE: Optional[str] = "clients.json"  # json: {"tokens":["..."]} or ["..."]
     ALLOW_BEARER_FROM_AUTH_HEADER: bool = True
     CLIENT_HEADER_NAME: str = "x-api-key"  # alternative header for client tokens
@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # Adaptive client auth:
     # If client token starts with monitel: it is a private key and must be present in clients.json.
     # Otherwise the token is treated as an upstream API key and will be forwarded to the upstream.
+    # `strict` requires every client token to be configured; `pass_through` preserves
+    # the legacy behavior for explicitly trusted deployments.
+    CLIENT_TOKEN_MODE: str = "strict"
+    ADMIN_TOKEN: Optional[str] = None
 
     # --- HTTP client timeouts & transport ---
     HTTP_TIMEOUT_CONNECT: float = 20.0

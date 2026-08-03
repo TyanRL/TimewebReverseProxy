@@ -163,10 +163,10 @@ async def require_client(request: Request) -> Optional[str]:
     if not token:
         raise HTTPException(status_code=401, detail="Missing client token")
 
-    # If token is a private monitel token, require it to be present in clients.json
-    if isinstance(token, str) and token.startswith("monitel:"):
-        if token not in _client_tokens:
-            raise HTTPException(status_code=403, detail="Invalid client token")
+    # Strict mode prevents the proxy from becoming an open pass-through proxy.
+    # Legacy pass-through remains available only when explicitly configured.
+    if settings.CLIENT_TOKEN_MODE.strip().lower() == "strict" and token not in _client_tokens:
+        raise HTTPException(status_code=403, detail="Invalid client token")
 
-    # Otherwise treat token as an upstream API key and allow it (pass-through)
+    # In pass-through mode non-private tokens are treated as upstream API keys.
     return token
